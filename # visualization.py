@@ -1,166 +1,205 @@
-# main.py
-
-import os
-import sys
+# fixingsqft.py
+import streamlit as st
 import pandas as pd
-import numpy as np
 import folium
 from folium.plugins import MarkerCluster
-import branca
+from streamlit_folium import st_folium
+from branca.colormap import LinearColormap
+import re
 
-# 1) Filenames in current folder
-GEO_CSV = "leases_geocoded.csv"
-BLD_CSV = "leases_by_building.csv"
+# -----------------------------------------------------------------------------#
+# Streamlit page setup                                                         #
+# -----------------------------------------------------------------------------#
+st.set_page_config(page_title="Manhattan Leases Explorer", layout="wide")
 
-# 2) Sanity check
-for f in (GEO_CSV, BLD_CSV):
-    if not os.path.isfile(f):
-        print(f"ERROR: '{f}' not found in {os.getcwd()}")
-        sys.exit(1)
+# -----------------------------------------------------------------------------#
+# Helpers                                                                       #
+# -----------------------------------------------------------------------------#
+def _first_match(df: pd.DataFrame, patterns: list[str]) -> str | None:
+    """Return the first column whose name matches any regex in *patterns*."""
+    for pat in patterns:
+        for col in df.columns:
+            if re.search(pat, col, flags=re.I):
+                return col
+    return None
 
-# 3) Load
-print("Loading data…")
-leases_geo = pd.read_csv(GEO_CSV)
-leases_bld = pd.read_csv(BLD_CSV)
-print(f" → {len(leases_geo)} geocoded leases, {len(leases_bld)} buildings")
 
-# 4) Drop missing coords
-leases_geo = leases_geo.dropna(subset=['latitude','longitude'])
-leases_bld  = leases_bld.dropna(subset=['latitude','longitude'])
+@st.cache_data
+def load_data() -> pd.DataFrame:
+    """Read the CSV and normalise safety, accessibility and square-footage columns."""
+    df = (
+        pd.read_csv("manhattan_geo_access.csv")
+        .dropna(subset=["latitude", "longitude"])
+        .copy()
+    )
 
-# 5) Map #1: Individual leases
-print("Building individual-leases map…")
-required = {'company_name','leasedSF','internal_industry','full_address'}
-if required.issubset(leases_geo.columns):
-    # Size grouping
-    conds = [
-        leases_geo['leasedSF'] < 5000,
-        leases_geo['leasedSF'].between(5000,20000, inclusive='left'),
-        leases_geo['leasedSF'] >= 20000
-    ]
-    labels = ["Small (<5K SF)","Medium (5K–20K SF)","Large (20K+ SF)"]
-    leases_geo['size_group'] = np.select(conds, labels, default="Unknown")
-    cmap = {"Small (<5K SF)":"green","Medium (5K–20K SF)":"orange","Large (20K+ SF)":"red","Unknown":"gray"}
-
-    m1 = folium.Map(location=[40.78,-73.97], zoom_start=12, tiles="CartoDB positron")
-    cl1 = MarkerCluster(options={
-        'spiderfyOnMaxZoom': True,
-        'showCoverageOnHover': True,
-        'zoomToBoundsOnClick': True,
-        'maxClusterRadius': 120
-    }).add_to(m1)
-
-    for _, r in leases_geo.iterrows():
-        folium.CircleMarker(
-            [r.latitude, r.longitude],
-            radius=5, color=cmap[r.size_group],
-            fill=True, fill_opacity=0.8,
-            popup=folium.Popup(
-                f"<strong>{r.company_name}</strong><br>"
-                f"{r.leasedSF} SF — {r.size_group}<br>"
-                f"{r.internal_industry}<br>"
-                f"{r.full_address}", max_width=300
+    # ── 1  Safety (0–1, higher = safer) ───────────────────────────────────
+    crime_col = _first_match(df, [r"crime", r"risk", r"safety"])
+    if crime_col is None:
+        st.warning("No crime/safety column found – assigning neutral 0.5 scores.")
+        df["safety_score"] = 0.5
+    else:
+        df[crime_col] = pd.to_numeric(df[crime_col], errors="coerce")
+        df[crime_col].fillna(df[crime_col].mean(skipna=True), inplace=True)
+        if df[crime_col].max() > 1 or df[crime_col].min() < 0:
+            df[crime_col] = (df[crime_col] - df[crime_col].min()) / (
+                df[crime_col].max() - df[crime_col].min()
             )
-        ).add_to(cl1)
+        df["safety_score"] = 1 - df[crime_col]
 
-    # Legend
-    legend = """
-    <div style="
-      position: fixed; bottom:50px; left:50px;
-      border:2px solid grey; background:white; padding:8px;
-      z-index:9999; opacity:0.8;">
-      <b>Lease Size</b><br>
-      <span style="background:green; width:12px; display:inline-block;"></span> Small<br>
-      <span style="background:orange; width:12px; display:inline-block;"></span> Medium<br>
-      <span style="background:red; width:12px; display:inline-block;"></span> Large<br>
-    </div>
-    """
-    m1.get_root().html.add_child(folium.Element(legend))
-    m1.save("manhattan_leases_map.html")
-    print(" → manhattan_leases_map.html saved")
-else:
-    print("Skipping map1: missing required columns in leases_geocoded.csv")
+    # ── 2  Accessibility (0–1, higher = better) ───────────────────────────
+    acc_col = _first_match(
+        df,
+        [
+            r"(access|walk|transit).*score",
+            r"accessibility",
+            r"weighted_routes",
+        ],
+    )
+    if acc_col is None:
+        st.warning("No accessibility column found – assigning neutral 0.5 scores.")
+        df["accessibility_score"] = 0.5
+    else:
+        df[acc_col] = pd.to_numeric(df[acc_col], errors="coerce")
+        df[acc_col].fillna(df[acc_col].mean(skipna=True), inplace=True)
+        if df[acc_col].max() > 1 or df[acc_col].min() < 0:
+            df[acc_col] = (df[acc_col] - df[acc_col].min()) / (
+                df[acc_col].max() - df[acc_col].min()
+            )
+        df.rename(columns={acc_col: "accessibility_score"}, inplace=True)
 
-# 6) Map #2: Building-level clusters
-print("Building building-level clusters map…")
-bins   = [0,5000,20000,50000,100000]
-colors = ['#ffffcc','#ffeda0','#feb24c','#f03b20','#bd0026']
-step   = branca.colormap.StepColormap(
-    colors=colors,
-    index=bins + [leases_bld['total_leasedSF'].max()],
+    # ── 3  Square footage (SF) ────────────────────────────────────────────
+    sf_col = _first_match(
+        df,
+        [
+            r"(total_)?leased.*sf",   # total_leasedSF, leasedSF …
+            r"\bsf$",                # …_sf
+            r"sq.?ft",               # sqft, sq_ft, squarefoot
+            r"sf",                   # last-ditch fallback
+        ],
+    )
+    if sf_col is None:
+        raise ValueError(
+            "Could not detect a square-footage column. "
+            "Rename the CSV column or add another regex pattern."
+        )
+
+    df[sf_col] = pd.to_numeric(df[sf_col], errors="coerce")
+    df[sf_col].fillna(df[sf_col].mean(skipna=True), inplace=True)
+    df.rename(columns={sf_col: "leasedSF"}, inplace=True)
+
+    return df
+
+
+# -----------------------------------------------------------------------------#
+# Load data & build UI                                                         #
+# -----------------------------------------------------------------------------#
+df = load_data()
+
+# ── Sidebar filters ──────────────────────────────────────────────────────────
+st.sidebar.header("Filters")
+
+# 1) Square-footage slider
+sf_min = int(df["leasedSF"].min())
+sf_max_99 = int(df["leasedSF"].quantile(0.99))
+sf_low, sf_high = st.sidebar.slider(
+    "Square Footage Range (SF)",
+    min_value=sf_min,
+    max_value=sf_max_99,
+    value=(sf_min, sf_max_99),
+    step=500,
+)
+
+# 2) Safety slider
+safe_low, safe_high = st.sidebar.slider(
+    "Safety Score",
+    0.0,
+    1.0,
+    (0.0, 1.0),
+    0.01,
+)
+
+# 3) Accessibility slider
+acc_low, acc_high = st.sidebar.slider(
+    "Accessibility Score",
+    0.0,
+    1.0,
+    (0.0, 1.0),
+    0.01,
+)
+
+# Apply filters
+df_filt = df[
+    (df["leasedSF"].between(sf_low, sf_high))
+    & (df["safety_score"].between(safe_low, safe_high))
+    & (df["accessibility_score"].between(acc_low, acc_high))
+]
+
+st.sidebar.markdown(f"**Showing {len(df_filt):,} of {len(df):,} leases**")
+
+# -----------------------------------------------------------------------------#
+# Map helpers                                                                  #
+# -----------------------------------------------------------------------------#
+cmap = LinearColormap(
+    colors=["red", "orange", "yellow", "lightgreen", "green"],
     vmin=0,
-    vmax=leases_bld['total_leasedSF'].max(),
-    caption="Total Leased SF"
+    vmax=1,
 )
 
-m2 = folium.Map(location=[40.78,-73.97], zoom_start=13, tiles="CartoDB positron")
-cl2 = MarkerCluster(options={
-    'spiderfyOnMaxZoom': True,
-    'showCoverageOnHover': True,
-    'zoomToBoundsOnClick': True,
-    'maxClusterRadius': 20
-}).add_to(m2)
+ACC_ICONS = {
+    4: ("bus",     "#2b83ba"),  # 0.81–1.00
+    3: ("train",   "#abdda4"),  # 0.61–0.80
+    2: ("subway",  "#ffffbf"),  # 0.41–0.60
+    1: ("bicycle", "#fdae61"),  # 0.21–0.40
+    0: ("walk",    "#d7191c"),  # 0.00–0.20
+}
 
-for _, r in leases_bld.iterrows():
-    folium.CircleMarker(
-        [r.latitude, r.longitude],
-        radius=np.sqrt(r.total_leasedSF)/100,
-        color=step(r.total_leasedSF),
-        fill=True, fill_opacity=0.8,
+
+def icon_for_acc(score: float) -> folium.Icon:
+    bucket = min(4, int(score * 5))  # 0–0.999 → 0–4
+    name, colour = ACC_ICONS[bucket]
+    return folium.Icon(icon=name, prefix="fa", color="white", icon_color=colour)
+
+
+# -----------------------------------------------------------------------------#
+# Build Folium map                                                             #
+# -----------------------------------------------------------------------------#
+m = folium.Map(
+    location=[40.75, -73.97],
+    zoom_start=12,
+    tiles="cartodbpositron",
+)
+cluster = MarkerCluster().add_to(m)
+
+for _, row in df_filt.iterrows():
+    folium.Marker(
+        location=[row.latitude, row.longitude],
+        icon=icon_for_acc(row["accessibility_score"]),
+        tooltip=row.get("full_address", ""),
         popup=folium.Popup(
-            f"<strong>{r.full_address}</strong><br>"
-            f"{r.company_list}<br>"
-            f"{r.sector_list}<br>"
-            f"{r.total_leasedSF} SF across {r.lease_count} leases",
-            max_width=300
-        )
-    ).add_to(cl2)
+            html=(
+                f"<b>{row.get('full_address', 'No address')}</b><br>"
+                f"SF&nbsp;:&nbsp;{int(row['leasedSF']):,}<br>"
+                f"Safety&nbsp;:&nbsp;{row['safety_score']:.2f}<br>"
+                f"Access&nbsp;:&nbsp;{row['accessibility_score']:.2f}"
+            ),
+            max_width=300,
+        ),
+    ).add_to(cluster)
 
-step.add_to(m2)
-m2.save("manhattan_building_clusters.html")
-print(" → manhattan_building_clusters.html saved")
+cmap.caption = "Safety Score (red = riskier → green = safer)"
+cmap.add_to(m)
 
-# 7) Map #3: Jittered leases
-print("Building jittered-leases map…")
-dfj = leases_geo.copy() if 'leasedSF' in leases_geo.columns else leases_bld.copy()
-if 'total_leasedSF' in dfj.columns and 'leasedSF' not in dfj.columns:
-    dfj['leasedSF'] = dfj['total_leasedSF']
-
-dfj['latitude']  += np.random.normal(scale=0.0001, size=len(dfj))
-dfj['longitude'] += np.random.normal(scale=0.0001, size=len(dfj))
-
-c_bins = np.linspace(dfj.leasedSF.min(), dfj.leasedSF.max(), 6)
-cmap_j = branca.colormap.StepColormap(
-    colors=colors,
-    index=c_bins.tolist(),
-    vmin=c_bins.min(),
-    vmax=c_bins.max(),
-    caption="Lease Size (SF)"
+# -----------------------------------------------------------------------------#
+# Streamlit layout                                                             #
+# -----------------------------------------------------------------------------#
+st.title("Manhattan Leases Explorer")
+st.write(
+    """
+    Use the sidebar to filter by square footage, neighbourhood safety, and public-
+    transport accessibility. Markers are coloured by accessibility; the colour bar
+    shows relative safety.
+    """
 )
 
-m3 = folium.Map(location=[40.78,-73.97], zoom_start=13, tiles="CartoDB positron")
-cl3 = MarkerCluster(options={
-    'spiderfyOnMaxZoom': True,
-    'showCoverageOnHover': True,
-    'zoomToBoundsOnClick': True,
-    'maxClusterRadius': 80
-}).add_to(m3)
-
-for _, r in dfj.iterrows():
-    folium.CircleMarker(
-        [r.latitude, r.longitude],
-        radius=4,
-        color=cmap_j(r.leasedSF),
-        fill=True, fill_opacity=0.7,
-        popup=folium.Popup(
-            f"<strong>{getattr(r,'company_name',r.company_list)}</strong><br>"
-            f"{r.leasedSF} SF — {getattr(r,'internal_industry',r.sector_list)}<br>"
-            f"{r.full_address}", max_width=300
-        )
-    ).add_to(cl3)
-
-cmap_j.add_to(m3)
-m3.save("manhattan_jittered_leases_map.html")
-print(" → manhattan_jittered_leases_map.html saved")
-
-print("All maps built—open the HTML files in your browser.")
+st_folium(m, height=600, width=900, returned_objects=[])
