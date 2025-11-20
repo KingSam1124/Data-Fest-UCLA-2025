@@ -1,4 +1,4 @@
-This repository contains our team’s submission for ASA DataFest 2025, a nationwide data analysis challenge hosted by the American Statistical Association. Teams are given 48 hours to work with a large, complex, and previously unseen dataset provided by an industry partner. 
+This repository contains my teams work for ASA DataFest 2025, a nationwide data analysis challenge hosted by the American Statistical Association. Teams are given 48 hours to work with a large, complex, and previously unseen dataset provided by an industry partner. 
 
 Our goal was to:
 
